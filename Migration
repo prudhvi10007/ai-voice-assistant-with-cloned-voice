@@ -1,0 +1,753 @@
+# Migration Task: Replace Claude + ElevenLabs with Groq + Chatterbox
+
+You are refactoring an existing voice agent app. The app currently uses **Anthropic Claude API** for LLM and **ElevenLabs API** for voice cloning + TTS. You need to replace both with **free** alternatives while keeping the same app structure, frontend flow, and user experience.
+
+## Summary of Changes
+
+| Component | Current (Remove) | New (Replace With) |
+|-----------|------------------|--------------------|
+| LLM Brain | Anthropic Claude API (`anthropic` SDK) | Groq API (`groq` SDK) — free, 14,400 req/day |
+| TTS + Voice Cloning | ElevenLabs cloud API (`httpx` calls) | Chatterbox TTS (self-hosted, `chatterbox-tts` pip package) — free, unlimited |
+| Voice Cloning Method | Upload audio → ElevenLabs API → returns `voice_id` | Save audio file on server → pass as `audio_prompt_path` to Chatterbox |
+| TTS Method | Send text + voice_id → ElevenLabs API → returns audio bytes | Run `model.generate(text, audio_prompt_path=file)` locally → returns wav tensor |
+| API Keys Needed | `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | `GROQ_API_KEY` only (free at console.groq.com) |
+| GPU Requirement | None (cloud APIs) | Backend needs a GPU with 4GB+ VRAM (or CPU fallback, slower) |
+
+---
+
+## PART 1: Replace Anthropic Claude with Groq
+
+### 1.1 Update Dependencies
+
+In `backend/requirements.txt`:
+- **Remove**: `anthropic==0.43.0`
+- **Add**: `groq==0.25.0`
+
+### 1.2 Update Environment Variables
+
+In `.env` and `.env.example`:
+- **Remove**: `ANTHROPIC_API_KEY=sk-ant-api03-xxxxx`
+- **Remove**: `ELEVENLABS_API_KEY=xi-xxxxx`
+- **Add**: `GROQ_API_KEY=gsk_xxxxxxxxxxxxx`
+
+Update `backend/app/config.py`:
+```python
+from pydantic_settings import BaseSettings
+from typing import List
+
+
+class Settings(BaseSettings):
+    groq_api_key: str = ""
+    allowed_origins: List[str] = ["http://localhost:5173"]
+    voice_samples_dir: str = "./voice_samples"
+    port: int = 8000
+    env: str = "development"
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+settings = Settings()
+```
+
+### 1.3 Replace `backend/app/services/anthropic_llm.py` → `backend/app/services/groq_llm.py`
+
+**Delete** the file `anthropic_llm.py` entirely. **Create** `groq_llm.py`:
+
+```python
+import os
+from groq import Groq
+from typing import List, Iterator
+
+def _get_client(api_key: str | None = None) -> Groq:
+    key = api_key or os.environ.get("GROQ_API_KEY", "")
+    return Groq(api_key=key)
+
+
+def ask(
+    messages: List[dict],
+    system_prompt: str,
+    api_key: str | None = None,
+) -> str:
+    """
+    Send messages to Groq (Llama 3.3 70B) and get a response.
+    messages format: [{"role": "user", "content": "..."}, ...]
+    """
+    client = _get_client(api_key)
+
+    all_messages = [{"role": "system", "content": system_prompt}] + messages
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=1024,
+        messages=all_messages,
+    )
+    return response.choices[0].message.content
+
+
+def ask_stream(
+    messages: List[dict],
+    system_prompt: str,
+    api_key: str | None = None,
+) -> Iterator[str]:
+    """
+    Stream Groq's response token by token.
+    Yields text delta strings.
+    """
+    client = _get_client(api_key)
+
+    all_messages = [{"role": "system", "content": system_prompt}] + messages
+
+    stream = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=1024,
+        messages=all_messages,
+        stream=True,
+    )
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+```
+
+**Key differences from Anthropic:**
+- Groq uses OpenAI-compatible API format (system message goes in the messages array, not a separate `system` param)
+- `groq` SDK is synchronous by default (not async), so remove `async` from function signatures
+- Model is `llama-3.3-70b-versatile` (free, fast, 128K context)
+- Streaming uses the same OpenAI-style delta pattern
+
+### 1.4 Update Router Imports
+
+In `backend/app/routers/chat.py`, update all imports:
+- **Replace**: `from app.services import anthropic_llm` 
+- **With**: `from app.services import groq_llm`
+- **Replace** all calls from `anthropic_llm.ask(...)` → `groq_llm.ask(...)`
+- **Replace** all calls from `anthropic_llm.ask_stream(...)` → `groq_llm.ask_stream(...)`
+- **Remove** `async` from the generator in `ask_stream` since Groq streaming is synchronous
+- **Remove** any `x_anthropic_key` header references OR rename to `x_groq_key`
+
+### 1.5 Update Frontend API Headers
+
+In `frontend/src/services/api.ts`:
+- **Remove** any `x-anthropic-key` header references
+- **Replace with** `x-groq-key` if you want user-provided keys, OR remove entirely since Groq key is server-side
+
+---
+
+## PART 2: Replace ElevenLabs with Chatterbox TTS
+
+This is the bigger change. Instead of calling a cloud API, you'll run an open-source TTS model directly on the backend server.
+
+### 2.1 Update Dependencies
+
+In `backend/requirements.txt`:
+- **Remove**: `httpx==0.28.1` (if only used for ElevenLabs; keep if used elsewhere)
+- **Add**:
+```
+chatterbox-tts==0.1.6
+torchaudio>=2.0.0
+torch>=2.0.0
+soundfile>=0.12.0
+numpy<2.0.0
+```
+
+### 2.2 Create `backend/app/services/chatterbox_tts.py`
+
+**Delete** `elevenlabs.py` entirely. **Create** `chatterbox_tts.py`:
+
+```python
+import os
+import io
+import uuid
+import torch
+import torchaudio as ta
+import soundfile as sf
+from pathlib import Path
+from chatterbox.tts import ChatterboxTTS
+
+from app.config import settings
+
+# ── Global model (loaded once at startup) ──
+_model: ChatterboxTTS | None = None
+
+
+def get_model() -> ChatterboxTTS:
+    """Load the Chatterbox model (lazy singleton)."""
+    global _model
+    if _model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading Chatterbox TTS model on {device}...")
+        _model = ChatterboxTTS.from_pretrained(device=device)
+        print("Chatterbox TTS model loaded.")
+    return _model
+
+
+def get_voice_dir() -> Path:
+    """Get the directory where voice samples are stored."""
+    voice_dir = Path(settings.voice_samples_dir)
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    return voice_dir
+
+
+def save_voice_sample(filename: str, audio_bytes: bytes) -> str:
+    """
+    Save an uploaded voice sample to disk.
+    Returns the saved file path.
+    """
+    voice_dir = get_voice_dir()
+    filepath = voice_dir / filename
+    with open(filepath, "wb") as f:
+        f.write(audio_bytes)
+    return str(filepath)
+
+
+def clone_voice(
+    name: str,
+    audio_files: list[tuple[str, bytes]],  # [(filename, content)]
+) -> dict:
+    """
+    'Clone' a voice by saving the reference audio file.
+    Chatterbox doesn't need a separate cloning step —
+    it uses a reference audio file at generation time (zero-shot).
+
+    We save the FIRST file as the reference and return a voice_id.
+    For best quality, the reference should be 5-30 seconds of clean speech.
+    """
+    voice_id = str(uuid.uuid4())[:8]
+    voice_dir = get_voice_dir()
+
+    # Save primary reference audio
+    primary_file = audio_files[0]
+    ext = primary_file[0].rsplit(".", 1)[-1] if "." in primary_file[0] else "webm"
+    ref_filename = f"{voice_id}_ref.{ext}"
+    ref_path = voice_dir / ref_filename
+
+    with open(ref_path, "wb") as f:
+        f.write(primary_file[1])
+
+    # If webm, convert to wav for Chatterbox compatibility
+    wav_path = voice_dir / f"{voice_id}_ref.wav"
+    if ext != "wav":
+        try:
+            waveform, sr = ta.load(str(ref_path))
+            # Resample to 24kHz if needed (Chatterbox prefers 24k+)
+            if sr != 24000:
+                resampler = ta.transforms.Resample(orig_freq=sr, new_freq=24000)
+                waveform = resampler(waveform)
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            ta.save(str(wav_path), waveform, 24000)
+        except Exception:
+            # Fallback: just save raw bytes as wav
+            wav_path = ref_path
+
+    # Save metadata
+    meta_path = voice_dir / f"{voice_id}.meta"
+    with open(meta_path, "w") as f:
+        f.write(f"{name}\n{wav_path}")
+
+    return {"voice_id": voice_id, "name": name}
+
+
+def text_to_speech(
+    text: str,
+    voice_id: str,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+) -> bytes:
+    """
+    Generate speech from text using a cloned voice reference.
+    Returns: raw WAV audio bytes.
+    """
+    model = get_model()
+    voice_dir = get_voice_dir()
+
+    # Load the reference audio path from metadata
+    meta_path = voice_dir / f"{voice_id}.meta"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Voice '{voice_id}' not found")
+
+    lines = meta_path.read_text().strip().split("\n")
+    ref_audio_path = lines[1] if len(lines) > 1 else None
+
+    if ref_audio_path and os.path.exists(ref_audio_path):
+        wav = model.generate(
+            text,
+            audio_prompt_path=ref_audio_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+        )
+    else:
+        # No reference — use default voice
+        wav = model.generate(text)
+
+    # Convert tensor to WAV bytes
+    buffer = io.BytesIO()
+    ta.save(buffer, wav, model.sr, format="wav")
+    buffer.seek(0)
+    return buffer.read()
+
+
+def list_voices() -> list[dict]:
+    """List all saved voice clones."""
+    voice_dir = get_voice_dir()
+    voices = []
+    for meta_file in voice_dir.glob("*.meta"):
+        voice_id = meta_file.stem
+        lines = meta_file.read_text().strip().split("\n")
+        name = lines[0] if lines else voice_id
+        voices.append({"voice_id": voice_id, "name": name})
+    return voices
+
+
+def delete_voice(voice_id: str) -> bool:
+    """Delete a voice clone and its files."""
+    voice_dir = get_voice_dir()
+    deleted = False
+
+    for f in voice_dir.glob(f"{voice_id}*"):
+        f.unlink()
+        deleted = True
+
+    return deleted
+```
+
+**Key architecture differences from ElevenLabs:**
+- No API key needed — model runs locally
+- No separate "cloning" step — Chatterbox does zero-shot voice cloning at generation time using a reference audio file
+- Voice samples are saved to disk, not uploaded to a cloud service
+- `voice_id` is just a local identifier pointing to a saved audio reference file
+- The model is loaded once into GPU memory and reused (singleton pattern)
+- Output is WAV format (not MP3 like ElevenLabs)
+- Two control parameters: `exaggeration` (0.0=monotone, 1.0+=dramatic) and `cfg_weight` (0.0=more creative, 1.0=more faithful)
+
+### 2.3 Update `backend/app/routers/voice.py`
+
+Replace all ElevenLabs calls with Chatterbox:
+
+```python
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi.responses import Response
+from typing import List
+
+from app.services import chatterbox_tts
+from app.models.schemas import SpeakRequest, CloneVoiceResponse
+
+router = APIRouter()
+
+
+@router.post("/clone", response_model=CloneVoiceResponse)
+async def clone_voice(
+    name: str = Form(...),
+    files: List[UploadFile] = File(...),
+):
+    """Clone a voice from uploaded audio samples."""
+    if len(files) == 0:
+        raise HTTPException(400, "At least one audio file is required")
+
+    audio_files = []
+    for f in files:
+        content = await f.read()
+        if len(content) == 0:
+            raise HTTPException(400, f"Empty file: {f.filename}")
+        audio_files.append((f.filename or "sample.webm", content))
+
+    try:
+        result = chatterbox_tts.clone_voice(name=name, audio_files=audio_files)
+        return CloneVoiceResponse(voice_id=result["voice_id"], name=result["name"])
+    except Exception as e:
+        raise HTTPException(500, f"Voice cloning failed: {str(e)}")
+
+
+@router.post("/speak")
+async def text_to_speech(req: SpeakRequest):
+    """Convert text to speech using a cloned voice. Returns audio/wav bytes."""
+    try:
+        audio_bytes = chatterbox_tts.text_to_speech(
+            text=req.text,
+            voice_id=req.voice_id,
+        )
+        return Response(content=audio_bytes, media_type="audio/wav")
+    except FileNotFoundError:
+        raise HTTPException(404, f"Voice '{req.voice_id}' not found")
+    except Exception as e:
+        raise HTTPException(500, f"Text-to-speech failed: {str(e)}")
+
+
+@router.get("/list")
+async def list_voices():
+    """List all saved voice clones."""
+    voices = chatterbox_tts.list_voices()
+    return {"voices": voices}
+
+
+@router.delete("/{voice_id}")
+async def delete_voice(voice_id: str):
+    """Delete a cloned voice."""
+    success = chatterbox_tts.delete_voice(voice_id)
+    if not success:
+        raise HTTPException(404, "Voice not found or already deleted")
+    return {"deleted": True, "voice_id": voice_id}
+```
+
+**Changes from original:**
+- Remove all `x_elevenlabs_key` header parameters (no API keys needed)
+- Remove `/speak-stream` endpoint (Chatterbox generates full audio at once, not streamed)
+- Response media type changes from `audio/mpeg` to `audio/wav`
+- `clone_voice` no longer calls an external API — it saves files locally
+
+### 2.4 Update `backend/app/routers/chat.py`
+
+```python
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse, Response
+from typing import Optional
+import json
+
+from app.services import groq_llm, chatterbox_tts
+from app.models.schemas import AskRequest, AskResponse, AskAndSpeakRequest
+
+router = APIRouter()
+
+
+@router.post("/ask", response_model=AskResponse)
+async def ask_question(req: AskRequest):
+    """Send a question to Groq and get a text response."""
+    messages = [{"role": m.role, "content": m.content} for m in req.history]
+    messages.append({"role": "user", "content": req.question})
+
+    try:
+        answer = groq_llm.ask(
+            messages=messages,
+            system_prompt=req.system_prompt,
+        )
+        return AskResponse(answer=answer)
+    except Exception as e:
+        raise HTTPException(502, f"Groq API error: {str(e)}")
+
+
+@router.post("/ask-stream")
+async def ask_question_stream(req: AskRequest):
+    """Stream Groq's response as Server-Sent Events."""
+    messages = [{"role": m.role, "content": m.content} for m in req.history]
+    messages.append({"role": "user", "content": req.question})
+
+    def generate():
+        try:
+            full_response = ""
+            for token in groq_llm.ask_stream(
+                messages=messages,
+                system_prompt=req.system_prompt,
+            ):
+                full_response += token
+                yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done', 'full_text': full_response})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/ask-and-speak")
+async def ask_and_speak(req: AskAndSpeakRequest):
+    """Ask Groq a question, then return the answer as spoken audio."""
+    messages = [{"role": m.role, "content": m.content} for m in req.history]
+    messages.append({"role": "user", "content": req.question})
+
+    try:
+        # Step 1: Get text answer from Groq
+        answer = groq_llm.ask(
+            messages=messages,
+            system_prompt=req.system_prompt,
+        )
+
+        # Step 2: Convert to speech with Chatterbox
+        audio_bytes = chatterbox_tts.text_to_speech(
+            text=answer,
+            voice_id=req.voice_id,
+        )
+
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={"X-Agent-Answer": answer[:500]},
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Ask-and-speak failed: {str(e)}")
+```
+
+**Changes from original:**
+- `async for` loops become regular `for` loops (Groq streaming is synchronous)
+- Remove all API key header parameters
+- Audio responses are `audio/wav` not `audio/mpeg`
+
+### 2.5 Update Pydantic Schemas
+
+In `backend/app/models/schemas.py`, simplify the `SpeakRequest`:
+
+```python
+class SpeakRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+    voice_id: str
+    exaggeration: float = Field(default=0.5, ge=0.0, le=2.0)
+    cfg_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+```
+
+- **Remove**: `stability`, `similarity_boost`, `style` fields (these are ElevenLabs-specific)
+- **Add**: `exaggeration` (emotion intensity, 0=monotone, 1+=dramatic), `cfg_weight` (voice faithfulness)
+
+Also simplify `AskAndSpeakRequest` — remove `stability` and `similarity_boost` fields.
+
+---
+
+## PART 3: Frontend Changes
+
+### 3.1 Update `frontend/src/services/api.ts`
+
+Key changes:
+- **Remove** all `elevenLabsKey` parameters and `x-elevenlabs-key` headers
+- **Change** audio response handling from `audio/mpeg` to `audio/wav`
+- The `speak()` function body payload changes from `stability`/`similarity_boost` to `exaggeration`/`cfg_weight`
+
+### 3.2 Update `frontend/src/components/ApiKeySetup.tsx`
+
+- **Remove** the ElevenLabs API key input field entirely
+- The only key needed is Groq, and that's server-side
+- This step can become just an info/welcome screen, OR skip it entirely and go straight to recording
+- If you still want the user to provide their own Groq key, keep one input field and relabel it
+
+### 3.3 Update `frontend/src/hooks/useVoiceAgent.ts`
+
+- **Remove** `elevenLabsKey` from the `AgentConfig` type and all references to it
+- Update the `speak()` call to not pass `elevenLabsKey`
+
+### 3.4 Update Audio Playback
+
+In `ChatInterface.tsx` or wherever audio is played:
+- The `new Audio(url)` call should work the same — browsers can play WAV
+- No changes needed for basic playback
+- If you were setting `type: "audio/mpeg"`, change to `type: "audio/wav"`
+
+### 3.5 Update `frontend/src/types/index.ts`
+
+```typescript
+export interface AgentConfig {
+  voiceId: string;
+  voiceName: string;
+  systemPrompt: string;
+  // Remove: elevenLabsKey field
+}
+```
+
+---
+
+## PART 4: Infrastructure & Startup
+
+### 4.1 Model Preloading
+
+Add model preloading to `backend/app/main.py` so the Chatterbox model loads when the server starts (not on the first request):
+
+```python
+@app.on_event("startup")
+async def startup_event():
+    """Preload the Chatterbox TTS model on startup."""
+    from app.services.chatterbox_tts import get_model
+    try:
+        get_model()
+        print("Chatterbox TTS model ready.")
+    except Exception as e:
+        print(f"Warning: Failed to preload TTS model: {e}")
+```
+
+### 4.2 Create Voice Samples Directory
+
+Add to `main.py` startup or use the config default:
+
+```python
+import os
+os.makedirs("./voice_samples", exist_ok=True)
+```
+
+### 4.3 Update `backend/requirements.txt`
+
+Final requirements file:
+
+```
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+groq==0.25.0
+chatterbox-tts==0.1.6
+torch>=2.0.0
+torchaudio>=2.0.0
+soundfile>=0.12.0
+numpy<2.0.0
+python-multipart==0.0.20
+python-dotenv==1.0.1
+pydantic-settings==2.7.1
+```
+
+Remove: `anthropic`, `httpx` (unless used elsewhere)
+
+### 4.4 Update Dockerfile
+
+The backend Dockerfile needs CUDA support for GPU inference:
+
+```dockerfile
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /app
+
+# Install system dependencies for audio processing
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ app/
+
+# Create voice samples directory
+RUN mkdir -p /app/voice_samples
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+For CPU-only (slower but works anywhere):
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ app/
+RUN mkdir -p /app/voice_samples
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 4.5 Update `.env.example`
+
+```env
+# Required — Get free key at https://console.groq.com
+GROQ_API_KEY=gsk_xxxxxxxxxxxxx
+
+# Optional
+ALLOWED_ORIGINS=http://localhost:5173
+VOICE_SAMPLES_DIR=./voice_samples
+PORT=8000
+ENV=development
+```
+
+---
+
+## PART 5: Checklist
+
+Run through this after implementation to verify everything works:
+
+- [ ] `pip install groq chatterbox-tts` runs without errors
+- [ ] Backend starts: `uvicorn app.main:app --reload` — Chatterbox model loads on startup
+- [ ] `GET /api/health` returns `{"status": "ok", "groq_configured": true, "tts_model_loaded": true}`
+- [ ] Frontend → Record step: MediaRecorder captures audio
+- [ ] `POST /api/voice/clone` with audio file → returns `voice_id`
+- [ ] `GET /api/voice/list` → shows the cloned voice
+- [ ] `POST /api/chat/ask` with a question → Groq returns text answer
+- [ ] `POST /api/voice/speak` with text + voice_id → returns WAV audio that sounds like the cloned voice
+- [ ] `POST /api/chat/ask-and-speak` → full pipeline works
+- [ ] `POST /api/chat/ask-stream` → SSE tokens stream correctly
+- [ ] Audio plays in the browser (WAV format)
+- [ ] `DELETE /api/voice/{voice_id}` → deletes voice files
+- [ ] No references to `anthropic`, `elevenlabs`, `xi-api-key`, or `x-anthropic-key` remain in codebase
+
+---
+
+## Quick Reference: API Equivalents
+
+### Groq (replaces Anthropic Claude)
+
+```python
+# Old (Anthropic)
+from anthropic import Anthropic
+client = Anthropic(api_key="sk-ant-...")
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    system="You are helpful.",
+    messages=[{"role": "user", "content": "Hi"}],
+)
+answer = response.content[0].text
+
+# New (Groq)
+from groq import Groq
+client = Groq(api_key="gsk_...")
+response = client.chat.completions.create(
+    model="llama-3.3-70b-versatile",
+    messages=[
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ],
+)
+answer = response.choices[0].message.content
+```
+
+### Chatterbox (replaces ElevenLabs)
+
+```python
+# Old (ElevenLabs) — Clone voice
+response = httpx.post("https://api.elevenlabs.io/v1/voices/add",
+    headers={"xi-api-key": key},
+    data={"name": name},
+    files=[("files", (filename, content, "audio/webm"))],
+)
+voice_id = response.json()["voice_id"]
+
+# New (Chatterbox) — Just save the reference file
+ref_path = f"./voice_samples/{voice_id}_ref.wav"
+with open(ref_path, "wb") as f:
+    f.write(audio_content)
+
+# Old (ElevenLabs) — TTS
+response = httpx.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+    headers={"xi-api-key": key},
+    json={"text": text, "model_id": "eleven_turbo_v2_5", "voice_settings": {...}},
+)
+audio_bytes = response.content  # MP3
+
+# New (Chatterbox) — TTS
+from chatterbox.tts import ChatterboxTTS
+import torchaudio as ta
+import io
+
+model = ChatterboxTTS.from_pretrained(device="cuda")
+wav = model.generate(text, audio_prompt_path=ref_path)
+buffer = io.BytesIO()
+ta.save(buffer, wav, model.sr, format="wav")
+audio_bytes = buffer.getvalue()  # WAV
+```
+
+---
+
+## Important Notes
+
+1. **Chatterbox model is ~2GB** — first run will download from HuggingFace automatically
+2. **GPU strongly recommended** — inference takes ~2-5 seconds on GPU, 30-60 seconds on CPU
+3. **Python 3.11 required** for Chatterbox (3.10+ may work but 3.11 is tested)
+4. **Audio format is WAV** — browsers handle WAV natively, no conversion needed
+5. **Voice cloning is zero-shot** — no training step, just pass a reference audio at generation time
+6. **Groq is free** — 14,400 requests/day, no credit card required, sign up at console.groq.com
+7. **For deployment**, consider RunPod or Vast.ai for cheap GPU instances (~$0.20/hr) if you don't have a local GPU
