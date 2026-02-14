@@ -1,5 +1,4 @@
 import { useVoiceAgent } from "./hooks/useVoiceAgent";
-import ApiKeySetup from "./components/ApiKeySetup";
 import VoiceRecorder from "./components/VoiceRecorder";
 import CloningStatus from "./components/CloningStatus";
 import ChatInterface from "./components/ChatInterface";
@@ -22,11 +21,6 @@ export default function App() {
     setError,
   } = useVoiceAgent();
 
-  const handleApiKeyComplete = (elevenLabsKey: string) => {
-    setConfig((prev) => ({ ...prev, elevenLabsKey }));
-    setStep("record");
-  };
-
   const handleSystemPromptChange = (prompt: string) => {
     setConfig((prev) => ({ ...prev, systemPrompt: prompt }));
   };
@@ -42,13 +36,13 @@ export default function App() {
           <h1 className="text-lg font-semibold">Voice Agent</h1>
           {/* Step indicator */}
           <div className="ml-auto flex items-center gap-2">
-            {(["setup", "record", "cloning", "agent"] as const).map((s, i) => (
+            {(["record", "cloning", "agent"] as const).map((s, i) => (
               <div
                 key={s}
                 className={`w-2 h-2 rounded-full ${
                   step === s
                     ? "bg-indigo-500"
-                    : i < ["setup", "record", "cloning", "agent"].indexOf(step)
+                    : i < ["record", "cloning", "agent"].indexOf(step)
                     ? "bg-indigo-500/50"
                     : "bg-gray-700"
                 }`}
@@ -60,9 +54,6 @@ export default function App() {
 
       {/* Main Content */}
       <main className="max-w-4xl mx-auto px-4 py-8 h-[calc(100vh-65px)] flex flex-col">
-        {step === "setup" && (
-          <ApiKeySetup onComplete={handleApiKeyComplete} />
-        )}
         {step === "record" && (
           <VoiceRecorder onClone={cloneVoice} />
         )}

@@ -19,7 +19,6 @@ export interface AgentConfig {
   voiceId: string;
   voiceName: string;
   systemPrompt: string;
-  elevenLabsKey: string;
 }
 
-export type AppStep = "setup" | "record" | "cloning" | "agent";
+export type AppStep = "record" | "cloning" | "agent";

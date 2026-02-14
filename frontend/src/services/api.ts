@@ -10,8 +10,7 @@ const api = axios.create({
 
 export async function cloneVoice(
   name: string,
-  files: Blob[],
-  elevenLabsKey?: string
+  files: Blob[]
 ): Promise<{ voice_id: string; name: string }> {
   const formData = new FormData();
   formData.append("name", name);
@@ -20,7 +19,6 @@ export async function cloneVoice(
   const { data } = await api.post("/voice/clone", formData, {
     headers: {
       "Content-Type": "multipart/form-data",
-      ...(elevenLabsKey && { "x-elevenlabs-key": elevenLabsKey }),
     },
   });
   return data;
@@ -28,36 +26,25 @@ export async function cloneVoice(
 
 export async function speak(
   text: string,
-  voiceId: string,
-  elevenLabsKey?: string
+  voiceId: string
 ): Promise<Blob> {
   const { data } = await api.post(
     "/voice/speak",
-    { text, voice_id: voiceId, stability: 0.5, similarity_boost: 0.8 },
+    { text, voice_id: voiceId, exaggeration: 0.5, cfg_weight: 0.5 },
     {
       responseType: "blob",
-      headers: elevenLabsKey ? { "x-elevenlabs-key": elevenLabsKey } : {},
     }
   );
   return data;
 }
 
-export async function listVoices(
-  elevenLabsKey?: string
-): Promise<{ voice_id: string; name: string }[]> {
-  const { data } = await api.get("/voice/list", {
-    headers: elevenLabsKey ? { "x-elevenlabs-key": elevenLabsKey } : {},
-  });
+export async function listVoices(): Promise<{ voice_id: string; name: string }[]> {
+  const { data } = await api.get("/voice/list");
   return data.voices;
 }
 
-export async function deleteVoice(
-  voiceId: string,
-  elevenLabsKey?: string
-): Promise<void> {
-  await api.delete(`/voice/${voiceId}`, {
-    headers: elevenLabsKey ? { "x-elevenlabs-key": elevenLabsKey } : {},
-  });
+export async function deleteVoice(voiceId: string): Promise<void> {
+  await api.delete(`/voice/${voiceId}`);
 }
 
 // ── Chat ──
@@ -79,8 +66,7 @@ export async function askAndSpeak(
   question: string,
   history: ChatMessage[],
   systemPrompt: string,
-  voiceId: string,
-  elevenLabsKey?: string
+  voiceId: string
 ): Promise<{ answer: string; audio: Blob }> {
   const response = await api.post(
     "/chat/ask-and-speak",
@@ -92,7 +78,6 @@ export async function askAndSpeak(
     },
     {
       responseType: "blob",
-      headers: elevenLabsKey ? { "x-elevenlabs-key": elevenLabsKey } : {},
     }
   );
 

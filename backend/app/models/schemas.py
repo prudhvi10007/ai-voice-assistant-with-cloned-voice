@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List
 
 
 # ── Voice ──
@@ -12,9 +12,8 @@ class CloneVoiceResponse(BaseModel):
 class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
     voice_id: str
-    stability: float = Field(default=0.5, ge=0.0, le=1.0)
-    similarity_boost: float = Field(default=0.8, ge=0.0, le=1.0)
-    style: float = Field(default=0.3, ge=0.0, le=1.0)
+    exaggeration: float = Field(default=0.5, ge=0.0, le=2.0)
+    cfg_weight: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class VoiceInfo(BaseModel):
@@ -48,5 +47,3 @@ class AskAndSpeakRequest(BaseModel):
     history: List[ChatMessage] = Field(default_factory=list)
     system_prompt: str = "You are a helpful personal assistant."
     voice_id: str
-    stability: float = 0.5
-    similarity_boost: float = 0.8
