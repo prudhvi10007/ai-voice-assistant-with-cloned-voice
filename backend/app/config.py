@@ -3,10 +3,9 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    elevenlabs_api_key: str = ""
-    anthropic_api_key: str = ""
-    deepgram_api_key: str = ""
+    groq_api_key: str = ""
     allowed_origins: List[str] = ["http://localhost:5173"]
+    voice_samples_dir: str = "./voice_samples"
     port: int = 8000
     env: str = "development"
 

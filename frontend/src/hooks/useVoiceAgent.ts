@@ -3,13 +3,12 @@ import { AppStep, ChatMessage, AgentConfig } from "../types";
 import * as api from "../services/api";
 
 export function useVoiceAgent() {
-  const [step, setStep] = useState<AppStep>("setup");
+  const [step, setStep] = useState<AppStep>("record");
   const [config, setConfig] = useState<AgentConfig>({
     voiceId: "",
     voiceName: "My Voice Clone",
     systemPrompt:
       "You are a helpful personal assistant. Answer concisely and conversationally, as if you were the person whose voice you have.",
-    elevenLabsKey: "",
   });
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -23,7 +22,7 @@ export function useVoiceAgent() {
       setStep("cloning");
       setError(null);
       try {
-        const result = await api.cloneVoice(name, blobs, config.elevenLabsKey);
+        const result = await api.cloneVoice(name, blobs);
         setConfig((prev) => ({
           ...prev,
           voiceId: result.voice_id,
@@ -36,7 +35,7 @@ export function useVoiceAgent() {
         setStep("record");
       }
     },
-    [config.elevenLabsKey]
+    []
   );
 
   const askQuestion = useCallback(
@@ -65,8 +64,7 @@ export function useVoiceAgent() {
           try {
             const audioBlob = await api.speak(
               answer,
-              config.voiceId,
-              config.elevenLabsKey
+              config.voiceId
             );
             const audioUrl = URL.createObjectURL(audioBlob);
             const audio = new Audio(audioUrl);
